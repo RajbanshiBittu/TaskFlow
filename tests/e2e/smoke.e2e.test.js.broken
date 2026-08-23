@@ -1,0 +1,450 @@
+import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+
+const API_URL = process.env.TEST_API_URL || "http://localhost:5000";
+
+const request = async (method, path, { token, body } = {}) => {
+    const response = await fetch(`${API_URL}${path}`, {
+        method,
+        headers: {
+            ...(body !== undefined
+                ? { "Content-Type": "application/json" }
+                : {}),
+            ...(token
+                ? { Authorization: `Bearer ${token}` }
+                : {})
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined
+    });
+
+    let data = null;
+
+    try {
+        data = await response.json();
+    } catch {
+        // Some endpoints may intentionally return an empty response.
+    }
+
+    return {
+        status: response.status,
+        data
+    };
+};
+
+const getAccessToken = (data) =>
+    data?.data?.accessToken ??
+    data?.accessToken ??
+    data?.data?.token ??
+    data?.token;
+
+const getRefreshToken = (data) =>
+    data?.data?.refreshToken ??
+    data?.refreshToken;
+
+const getResourceId = (data) =>
+    data?.data?.id ??
+    data?.data?.project?.id ??
+    data?.data?.task?.id ??
+    data?.id;
+
+const getJobId = (data) =>
+    data?.data?.jobId ??
+    data?.data?.job?.id ??
+    data?.jobId ??
+    data?.job?.id;
+
+const sleep = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForJob(jobId, token, expected = "completed") {
+    const timeout = 15_000;
+    const interval = 500;
+    const started = Date.now();
+
+    let lastResponse;
+
+    while (Date.now() - started < timeout) {
+        lastResponse = await request("GET", `/jobs/${jobId}`, {
+            token
+        });
+
+        const status =
+            lastResponse.data?.data?.status ??
+            lastResponse.data?.status;
+
+        if (status === expected) {
+            return lastResponse;
+        }
+
+        if (status === "failed") {
+            throw new Error(
+                `Job ${jobId} failed: ${JSON.stringify(lastResponse.data)}`
+            );
+        }
+
+        await sleep(interval);
+    }
+
+    throw new Error(
+        `Timed out waiting for job ${jobId}. Last response: ${JSON.stringify(
+            lastResponse?.data
+        )}`
+    );
+}
+
+describe("TaskFlow E2E smoke test", () => {
+    const suffix = randomUUID().slice(0, 8);
+
+    const admin = {
+        email: `e2e-admin-${suffix}@example.test`,
+        password: "TaskFlowE2E!2026",
+        name: "E2E Admin"
+    };
+
+    const member = {
+        email: `e2e-member-${suffix}@example.test`,
+        password: "TaskFlowE2E!2026",
+        name: "E2E Member"
+    };
+
+    let adminToken;
+    let refreshToken;
+
+    let memberToken;
+
+    let projectId;
+    let taskId;
+    let jobId;
+
+    beforeAll(async () => {
+        const health = await request("GET", "/health");
+
+        expect(
+            [200, 204].includes(health.status),
+            `API health check failed: ${JSON.stringify(health.data)}`
+        ).toBe(true);
+    });
+
+    afterAll(async () => {
+        /*
+         * Cleanup is intentionally best-effort.
+         *
+         * The test only creates its own project/task.
+         * Do not use prisma migrate reset or delete seeded data.
+         */
+        if (projectId && adminToken) {
+            const response = await request(
+                "DELETE",
+                `/projects/${projectId}`,
+                {
+                    token: adminToken
+                }
+            );
+
+            // Project deletion may already have happened during a test.
+            expect([204, 404]).toContain(response.status);
+        }
+    });
+
+    it("runs the complete TaskFlow business flow", async () => {
+        /*
+         * ---------------------------------------------------------
+         * 1. REGISTER ADMIN
+         * ---------------------------------------------------------
+         */
+
+        const registerAdmin = await request(
+            "POST",
+            "/auth/register",
+            {
+                body: admin
+            }
+        );
+
+        expect(
+            [201, 200],
+            `Admin registration failed: ${JSON.stringify(
+                registerAdmin.data
+            )}`
+        ).toContain(registerAdmin.status);
+
+        /*
+         * ---------------------------------------------------------
+         * 2. LOGIN ADMIN
+         * ---------------------------------------------------------
+         */
+
+        const loginAdmin = await request(
+            "POST",
+            "/auth/login",
+            {
+                body: {
+                    email: admin.email,
+                    password: admin.password
+                }
+            }
+        );
+
+        expect(
+            loginAdmin.status,
+            `Admin login failed: ${JSON.stringify(loginAdmin.data)}`
+        ).toBe(200);
+
+        adminToken = getAccessToken(loginAdmin.data);
+        refreshToken = getRefreshToken(loginAdmin.data);
+
+        expect(adminToken).toBeTruthy();
+        expect(refreshToken).toBeTruthy();
+
+        /*
+         * ---------------------------------------------------------
+         * 3. REFRESH TOKEN ROTATION
+         * ---------------------------------------------------------
+         */
+
+        const refresh = await request(
+            "POST",
+            "/auth/refresh",
+            {
+                body: {
+                    refreshToken
+                }
+            }
+        );
+
+        expect(
+            refresh.status,
+            `Refresh failed: ${JSON.stringify(refresh.data)}`
+        ).toBe(200);
+
+        const rotatedAccessToken = getAccessToken(refresh.data);
+        const rotatedRefreshToken = getRefreshToken(refresh.data);
+
+        expect(rotatedAccessToken).toBeTruthy();
+        expect(rotatedRefreshToken).toBeTruthy();
+
+        /*
+         * The old refresh token must no longer be reusable.
+         */
+
+        const reusedRefresh = await request(
+            "POST",
+            "/auth/refresh",
+            {
+                body: {
+                    refreshToken
+                }
+            }
+        );
+
+        expect(reusedRefresh.status).toBe(401);
+
+        adminToken = rotatedAccessToken;
+        refreshToken = rotatedRefreshToken;
+
+        /*
+         * ---------------------------------------------------------
+         * 4. REGISTER MEMBER
+         * ---------------------------------------------------------
+         *
+         * Depending on the current registration implementation,
+         * a registered user may automatically receive membership
+         * in its created organization.
+         */
+
+        const registerMember = await request(
+            "POST",
+            "/auth/register",
+            {
+                body: member
+            }
+        );
+
+        expect(
+            [201, 200],
+            `Member registration failed: ${JSON.stringify(
+                registerMember.data
+            )}`
+        ).toContain(registerMember.status);
+
+        const loginMember = await request(
+            "POST",
+            "/auth/login",
+            {
+                body: {
+                    email: member.email,
+                    password: member.password
+                }
+            }
+        );
+
+        expect(
+            loginMember.status,
+            `Member login failed: ${JSON.stringify(loginMember.data)}`
+        ).toBe(200);
+
+        memberToken = getAccessToken(loginMember.data);
+
+        expect(memberToken).toBeTruthy();
+
+        /*
+         * ---------------------------------------------------------
+         * 5. CREATE PROJECT
+         * ---------------------------------------------------------
+         */
+
+        const project = await request(
+            "POST",
+            "/projects",
+            {
+                token: adminToken,
+                body: {
+                    name: `E2E Project ${suffix}`,
+                    description: "Created by automated E2E test"
+                }
+            }
+        );
+
+        expect(
+            project.status,
+            `Project creation failed: ${JSON.stringify(project.data)}`
+        ).toBe(201);
+
+        projectId = getResourceId(project.data);
+
+        expect(projectId).toBeTruthy();
+
+        /*
+         * ---------------------------------------------------------
+         * 6. GET PROJECT
+         * ---------------------------------------------------------
+         */
+
+        const getProject = await request(
+            "GET",
+            `/projects/${projectId}`,
+            {
+                token: adminToken
+            }
+        );
+
+        expect(getProject.status).toBe(200);
+
+        /*
+         * ---------------------------------------------------------
+         * 7. UPDATE PROJECT
+         * ---------------------------------------------------------
+         */
+
+        const updateProject = await request(
+            "PATCH",
+            `/projects/${projectId}`,
+            {
+                token: adminToken,
+                body: {
+                    name: `Updated E2E Project ${suffix}`
+                }
+            }
+        );
+
+        expect(updateProject.status).toBe(200);
+
+        /*
+         * ---------------------------------------------------------
+         * 8. CREATE TASK
+         * ---------------------------------------------------------
+         */
+
+        const task = await request(
+            "POST",
+            `/projects/${projectId}/tasks`,
+            {
+                token: adminToken,
+                body: {
+                    title: `E2E Task ${suffix}`,
+                    description: "E2E task",
+                    status: "todo",
+                    priority: "high"
+                }
+            }
+        );
+
+        expect(
+            task.status,
+            `Task creation failed: ${JSON.stringify(task.data)}`
+        ).toBe(201);
+
+        taskId = getResourceId(task.data);
+
+        expect(taskId).toBeTruthy();
+
+        /*
+         * ---------------------------------------------------------
+         * 9. GET TASK
+         * ---------------------------------------------------------
+         */
+
+        const getTask = await request(
+            "GET",
+            `/tasks/${taskId}`,
+            {
+                token: adminToken
+            }
+        );
+
+        expect(getTask.status).toBe(200);
+
+        /*
+         * ---------------------------------------------------------
+         * 10. UPDATE TASK
+         * ---------------------------------------------------------
+         */
+
+        const updateTask = await request(
+            "PATCH",
+            `/tasks/${taskId}`,
+            {
+                token: adminToken,
+                body: {
+                    status: "in_progress",
+                    priority: "urgent"
+                }
+            }
+        );
+
+        expect(updateTask.status).toBe(200);
+
+        /*
+         * ---------------------------------------------------------
+         * 11. TASK FILTER + PAGINATION
+         * ---------------------------------------------------------
+         */
+
+        const tasks = await request(
+            "GET",
+            `/projects/${projectId}/tasks?status=in_progress&priority=urgent&page=1&limit=20`,
+            {
+                token: adminToken
+            }
+        );
+
+        expect(tasks.status).toBe(200);
+
+        expect(tasks.data).toBeTruthy();
+
+        /*
+         * Support the required pagination structure while
+         * remaining compatible with the existing response wrapper.
+         */
+
+        const pagination =
+            tasks.data?.data ?? tasks.data;
+
+        expect(pagination).toHaveProperty("total");
+        expect(pagination).toHaveProperty("page");
+        expect(pagination).toHaveProperty("limit");
+
+        /*
+         * ---------------------------------------------------------
+         * 12. DASHBOARD
+         * ---------------------------------------------------------

@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+coverage/
+dist/
+logs/
+
+.DS_Store
+.vscode/
+
+generated/
+coverage/
+logs/
