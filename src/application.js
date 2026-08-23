@@ -3,7 +3,7 @@ import express from "express";
 import helmet from "helmet";
 import pinoHttp from "pino-http";
 import prisma from "../src/config/database.js";
-
+import { setupSwagger } from "../swagger/swagger.js";
 import { HTTP_STATUS } from "./constants/httpStatus.js";
 import { logger } from "./config/logger.js";
 
@@ -19,6 +19,7 @@ import { errorHandler } from "./middlewares/error.middleware.js";
 
 const application = express();
 
+setupSwagger(application);
 
 application.use(helmet());
 // application.use(cors());
